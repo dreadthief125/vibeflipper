@@ -1,0 +1,113 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      template_ref:
+        description: "Optional branch/tag of FabricMC/fabric-example-mod (must target Minecraft 26.2)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ahflipper-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout mod sources
+        uses: actions/checkout@v4
+        with:
+          path: mod
+          fetch-depth: 1
+
+      - name: Fetch Fabric template
+        env:
+          REF: ${{ inputs.template_ref }}
+        run: |
+          if [ -n "$REF" ]; then
+            git clone --depth 1 --branch "$REF" https://github.com/FabricMC/fabric-example-mod.git template
+          else
+            git clone --depth 1 https://github.com/FabricMC/fabric-example-mod.git template
+          fi
+          MC=$(sed -n 's/^minecraft_version=//p' template/gradle.properties | head -1)
+          echo "Fabric template Minecraft version: ${MC:-unknown}"
+          if [ "$MC" != "26.2" ]; then
+            echo "ERROR: This source targets Minecraft 26.2, but the template resolves to '${MC:-unknown}'."
+            echo "Run workflow_dispatch with a template_ref compatible with Minecraft 26.2."
+            exit 1
+          fi
+
+      - name: Overlay mod sources
+        run: |
+          SRC=$(find mod -name FlipperMod.java -not -path '*/.git/*' | head -1)
+          if [ -z "$SRC" ]; then
+            echo "ERROR: FlipperMod.java not found"
+            find mod -type f | sort
+            exit 1
+          fi
+          SRCDIR=$(dirname "$SRC")
+          echo "Using Java sources from $SRCDIR"
+          DEST=template/src/main/java
+          if [ -d template/src/client ]; then DEST=template/src/client/java; fi
+          rm -rf template/src/main/java template/src/client
+          mkdir -p "$DEST/dev/flipper" template/src/main/resources
+          cp "$SRCDIR"/*.java "$DEST/dev/flipper/"
+          rm -f template/src/main/resources/*.mixins.json
+          cat > template/src/main/resources/fabric.mod.json <<'EOF'
+          {
+            "schemaVersion": 1,
+            "id": "ahflipper",
+            "version": "0.2.0",
+            "name": "AH Flipper",
+            "description": "BIN-only auction scanner and buyer with manual resale-price recommendations.",
+            "environment": "client",
+            "entrypoints": { "client": ["dev.flipper.FlipperMod"] },
+            "depends": { "fabricloader": ">=0.17", "minecraft": "~26.2", "fabric-api": "*" }
+          }
+          EOF
+          sed -i 's/^archives_base_name=.*/archives_base_name=ahflipper/' template/gradle.properties
+
+      - name: Detect Java version
+        id: java
+        run: |
+          J=$(grep -Eo 'VERSION_[0-9]+|release = [0-9]+' template/build.gradle | grep -Eo '[0-9]+$' | head -1)
+          echo "version=${J:-25}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ steps.java.outputs.version }}
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          build-root-directory: template
+
+      - name: Build mod
+        working-directory: template
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon clean build
+          test -n "$(find build/libs -maxdepth 1 -name '*.jar' -print -quit)"
+          ls -lh build/libs/*.jar
+
+      - name: Upload JAR artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ahflipper-jar
+          path: template/build/libs/*.jar
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Attach JAR to tagged release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: template/build/libs/*.jar
